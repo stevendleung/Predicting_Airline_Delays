@@ -1,0 +1,281 @@
+# Databricks notebook source
+from pyspark.sql import functions as f
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType, NullType, ShortType, DateType, BooleanType, BinaryType
+from pyspark.sql import SQLContext
+import pandas as pd
+from pyspark.ml.linalg import Vectors
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.classification import DecisionTreeClassifier
+from pyspark.ml.classification import RandomForestClassifier as RF
+from pyspark.mllib.tree import RandomForest, RandomForestModel
+from pyspark.mllib.util import MLUtils
+from pyspark.ml.feature import StringIndexer, VectorIndexer, VectorAssembler, SQLTransformer
+from pyspark.ml import Pipeline
+from pyspark.mllib.linalg import Vectors
+from pyspark.mllib.regression import LabeledPoint
+from pyspark.sql.functions import col
+from pyspark.ml import Pipeline
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.mllib.evaluation import BinaryClassificationMetrics
+import seaborn as sn
+import matplotlib.pyplot as plt
+import numpy as np
+from pyspark.sql.functions import col, explode, array, lit
+from sklearn import metrics
+from sklearn.metrics import roc_curve
+from sklearn.metrics import precision_recall_curve
+
+sqlContext = SQLContext(sc)
+
+final_project_path = "dbfs:/mnt/mids-w261/group_5/"
+
+train_data_output_path = final_project_path + "training_data_output/train.parquet"
+validation_data_output_path = final_project_path + "training_data_output/validation.parquet"
+test_data_output_path = final_project_path + "training_data_output/test.parquet"
+train_data_output_path_one_hot = final_project_path + "training_data_output/train_one_hot.parquet"
+test_data_output_path_one_hot = final_project_path + "training_data_output/test_one_hot.parquet"
+model_summary_path = final_project_path + "summary_table_val.csv"
+
+train_data_output_new = final_project_path + "training_data_output_tempnew/train_one_hot.parquet"
+
+train_set = spark.read.option("header", "true").parquet(train_data_output_path_one_hot)
+test_set = spark.read.option("header", "true").parquet(test_data_output_path_one_hot)
+
+# COMMAND ----------
+
+#Remove later when fixed
+#Use this section if validation set needed
+
+# val_set = train_set.where((col("year") == '2018')).cache()
+# train_set = train_set.where((col("year") == '2015') | (col("year") == '2016') | (col("year") == '2017')).cache()
+
+# COMMAND ----------
+
+def Undersampling(train_set, ratio = 4):
+  '''Oversampling is performed to account for the discrepancy in frequency between our positive and negative
+  classes. Takes train data set and ratio of major to minor class and returns oversampled dataframe'''
+  
+  major_df = train_set.filter(col("label") == 0)
+  minor_df = train_set.filter(col("label") == 1)
+  
+  sampled_majority_df = major_df.sample(False, 1/ratio)
+  train_set_undersampled = sampled_majority_df.unionAll(minor_df)
+  
+  return train_set_undersampled
+
+# COMMAND ----------
+
+train_set_undersampled = Undersampling(train_set, ratio = 4)
+
+# COMMAND ----------
+
+categorical = ['month_Index', 
+               'day_of_week_Index',
+               'crs_dep_hour_Index',
+               'Holiday_Index',
+               'PREVIOUS_FLIGHT_DELAYED_FOR_MODELS_Index', 
+               'distance_group_Index',  
+               'op_unique_carrier_Index',
+               'origin_airport_id_Index',
+               'origin_VIS_variability_Index', 
+               'dest_CIG_ceiling_visibility_okay_Index', 
+               'dest_WND_type_code_Index', 
+               'dest_VIS_variability_Index', 
+               'origin_CIG_ceiling_visibility_okay_Index',               
+               'origin_WND_type_code_Index', 
+               'ceiling_indicator_below_2000', 
+               'summer_indicator_below_zero', 
+               'winter_indicator_dew_above_165', 
+               'wind_indicator_above_50'
+       ]
+numeric = ["origin_num_flights",
+             "origin_avg_dep_delay", 
+             "origin_pct_dep_del15", 
+             "origin_avg_taxi_time", 
+             "origin_avg_weather_delay", 
+             "origin_avg_nas_delay", 
+             "origin_avg_security_delay", 
+             "origin_avg_late_aircraft_delay", 
+             "dest_num_flights",
+             "dest_avg_dep_delay", 
+             "dest_pct_dep_del15", 
+             "dest_avg_taxi_time", 
+             "dest_avg_weather_delay", 
+             "dest_avg_nas_delay", 
+             "dest_avg_security_delay", 
+             "dest_avg_late_aircraft_delay",
+             "carrier_num_flights", 
+             "carrier_avg_dep_delay", 
+             "carrier_avg_carrier_delay", 
+             "origin_WND_speed_rate", 
+             "origin_CIG_ceiling_height", 
+             "origin_VIS_distance", 
+             "origin_TMP_air_temperature", 
+             "origin_DEW_dew_point_temp", 
+             "dest_WND_speed_rate", 
+             "dest_CIG_ceiling_height", 
+             "dest_VIS_distance", 
+             "dest_TMP_air_temperature", 
+             "dest_DEW_dew_point_temp",
+             "origin_aa1_rain_depth", 
+             "dest_aa1_rain_depth", 
+             "origin_aj1_snow_depth", 
+             "dest_aj1_snow_depth"]
+
+# COMMAND ----------
+
+# # Assemble features into vector
+features = categorical + numeric
+assembler = VectorAssembler(inputCols=features, outputCol="features2")
+assembler.setHandleInvalid("skip")
+
+train_RF = assembler.transform(train_set)
+train_RF_US = assembler.transform(train_set_undersampled)
+#validation_RF = assembler.transform(val_set)
+test_RF = assembler.transform(test_set)
+
+# COMMAND ----------
+
+def FitRFModel(train_set, numTrees = 20, maxDepth = 5, maxBins = 400):
+  '''Takes train data and parameters for rf and returns fitted RF model.'''
+ 
+  #Define rf model
+  rf = RF(labelCol='label', featuresCol='features2', 
+        numTrees = numTrees, 
+        maxDepth = maxDepth,
+        maxBins = maxBins)
+  #Fit rf model
+  RF_model = rf.fit(train_set)
+  
+  return RF_model
+  
+def PredictandEvaluateModel (RF_model, test_set):
+  '''Takes fitted RF model and uses to make predictions on test or validation set.
+  Prints Evaluation metrics and a confusion matrix and returns evaluation metrics'''
+  
+  predictions = RF_model.transform(test_set)
+  
+  #Convert to pandas for more comprehensive evaluation metrics
+  predictions_Pandas = predictions.select('label','probability', 'prediction').toPandas()
+  scoreAndLabelsPandas = predictions_pandas[["prediction", "label"]]  
+  
+  true_positive = scoreAndLabelsPandas[(scoreAndLabelsPandas.label == 1) & (scoreAndLabelsPandas.prediction == 1) ]['label'].count()
+  true_negative = scoreAndLabelsPandas[(scoreAndLabelsPandas.label == 0) & (scoreAndLabelsPandas.prediction == 0)]['label'].count()
+  false_positive = scoreAndLabelsPandas[(scoreAndLabelsPandas.label == 0) & (scoreAndLabelsPandas.prediction == 1)]['prediction'].count()
+  false_negative = scoreAndLabelsPandas[(scoreAndLabelsPandas.label == 1) & (scoreAndLabelsPandas.prediction == 0)]['label'].count()
+  accuracy = (true_positive + true_negative)/ (true_positive + true_negative + false_positive + false_negative)
+
+  precision = true_positive / (false_positive + true_positive)
+  recall = true_positive / (false_negative + true_positive)
+  f1 = (2 * precision * recall)/ (precision + recall)
+
+  return scoreAndLabelsPandas, predictions_Pandas,  precision, recall, f1, accuracy
+  
+  
+def CreateConfusion(scoreandLabels):
+  '''Takes score and labels pandas df with columns "label" and "prediction"
+  and returns seaborn confusion matrix'''
+  confusion_matrix = pd.crosstab(scoreandLabels['label'], 
+                                 scoreandLabels['prediction'], 
+                                 rownames=['Actual'], 
+                                 colnames=['Predicted'])
+  sn.heatmap(confusion_matrix, annot=True,cmap='Blues', fmt='g')
+
+  plt.show()
+  
+def RocCurve(predictions_Pandas):
+
+  # calculate the fpr and tpr for all thresholds of the classification
+  probs = predictions_Pandas['probability'].str[1]
+  y_test = predictions_Pandas['label']
+
+  fpr, tpr, threshold = metrics.roc_curve(y_test, probs, pos_label=1)
+  roc_auc = metrics.auc(fpr, tpr)
+
+  #Plot
+  plt.title('Receiver Operating Characteristic')
+  plt.plot(fpr, tpr, 'b', label = 'AUC = %0.2f' % roc_auc)
+  plt.legend(loc = 'lower right')
+  plt.plot([0, 1], [0, 1],'r--')
+  plt.xlim([0, 1])
+  plt.ylim([0, 1])
+  plt.ylabel('True Positive Rate')
+  plt.xlabel('False Positive Rate')
+  plt.show()
+
+def PrCurve (predictions_Pandas):  
+  probs = predictions_Pandas['probability'].str[1]
+  y_test = predictions_Pandas['label']
+
+  # calculate model precision-recall curve
+  precision, recall, _ = precision_recall_curve(y_test, probs)
+  # plot the model precision-recall curve
+  plt.plot(recall, precision, marker='.', label='Random Forest')
+  # axis labels
+  plt.xlabel('Recall')
+  plt.ylabel('Precision')
+  # show the legend
+  plt.legend()
+  # show the plot
+  plt.show()
+  
+def RFmodelPipeline(train_set, test_set, numTreeList, maxDepthList, maxBins = 400):
+  '''Takes train and test set along with lists of number of trees and max depth
+  to run iterative RF models on. Fits model on train, Predicts on test and prints 
+  evaluation metrics and visualizations.'''
+  
+  summary_table = pd.DataFrame({'Model Number': [], 'NumTrees': [], 'MaxDepth':[], 
+                'Precision' : [], 'Recall' : [], 'F1 Score': [], 'Accuracy': []}).set_index('Model Number')
+  
+  model_number = 1
+  
+  for numTrees, maxDepth in zip(numTreeList, maxDepthList):
+    
+    RF_model = FitRFModel(train_set, numTrees = numTrees, maxDepth = maxDepth)
+    
+    scoreandLabels, predictions_Pandas, precision, recall, f1, accuracy = PredictandEvaluateModel (RF_model, test_set)
+  
+    print('''Model Number: {}
+    NumTrees: {}
+    MaxDepth: {}
+    Precision: {}
+    Recall: {}
+    F1: {}
+    Accuracy: {}
+    '''.format(model_number, numTrees,maxDepth, precision, recall, f1, accuracy))
+    
+    #Produce Confusion Matrix and Roc Curve
+    CreateConfusion(scoreandLabels)
+    
+    RocCurve(predictions_Pandas)
+    
+    PrCurve (predictions_Pandas)
+    
+    summary_table.loc[model_number] = [numTrees,
+                                      maxDepth,
+                                      precision,
+                                      recall,
+                                      f1,
+                                      accuracy]
+    
+    model_number += 1
+  print('Summary')
+  print(summary_table)
+  return summary_table, scoreandLabels
+
+# COMMAND ----------
+
+summary_table, scoreandLabels = RFmodelPipeline(train_RF_US, test_RF, [1], [1])
+
+
+# COMMAND ----------
+
+#Run to save files
+
+# scoreandLabelsSpark = spark.createDataFrame(scoreandLabels)
+# scoreandLabelsSpark.write.format("parquet").mode("overwrite").save(final_project_path + 'scoreandLabels.parquet')
+# summary_table_spark = spark.createDataFrame(summary_table)
+# summary_table_spark.write.format("csv").mode("overwrite").save(model_summary_path)
+#predictions = spark.createDataFrame(predictions_pandas)
+#predictions.write.format("parquet").mode("overwrite").save(final_project_path + 'predictions.parquet')
